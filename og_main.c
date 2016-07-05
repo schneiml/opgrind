@@ -40,61 +40,80 @@
 
 /* Table of opcodes. Generate like this:
  ( for op in $(grep -oE 'Iop_[^, =()]*,' libvex_ir.h | tr -d ','); do 
-    printf '[%-20s-Iop_INVALID] = 0' $op 
-    [[ $op =~ (32|64)F ]]               && printf ' | OP_FP'    # mostly vector things
-    [[ $op =~ (8|16|32|64)(U|I|S) ]]    && printf ' | OP_INT'   # should be exclusive wrt above
-    [[ $op =~ x(2|4|8|16)|V(128|256) ]] && printf ' | OP_VEC'   # all SIMD
-    [[ $op =~ D(32|64|128) ]]           && printf ' | OP_DEC'   # Decimal encoding, should not appear in amd64
-    [[ $op =~ F(32|64|128) ]]           && printf ' | OP_OLDFP' # Scalar FP (x87), should not appear
-    [[ $op =~ (U|I|S)(8|16|32|64) ]]    && printf ' | OP_INT'   # Scalar int
-    [[ $op =~ [UISFD][0-9]+|[0-9]+[UISFD] ]] || printf ' | OP_BITS' # none of the above
+    printf '[%-20s-Iop_INVALID] = 1' $op 
+    [[ $op =~ (32|64)F ]]               && printf ' | BIT(OP_FP)'    # mostly vector things
+    [[ $op =~ (8|16|32|64)(U|I|S) ]]    && printf ' | BIT(OP_INT)'   # should be exclusive wrt above
+    [[ $op =~ x(2|4|8|16)|V(128|256) ]] && printf ' | BIT(OP_VEC)'   # all SIMD
+    [[ $op =~ D(32|64|128) ]]           && printf ' | BIT(OP_DEC)'   # Decimal encoding, should not appear in amd64
+    [[ $op =~ F(32|64|128) ]]           && printf ' | BIT(OP_OLDFP)' # Scalar FP (x87), should not appear
+    [[ $op =~ (U|I|S)(8|16|32|64) ]]    && printf ' | BIT(OP_INT)'   # Scalar int
+    [[ $op =~ [UISFD][0-9]+|[0-9]+[UISFD] ]] || printf ' | BIT(OP_BITS)' # none of the above
     # Mul, Div, Add, Sub, conv ('to'), Sqrt, Cmp could also be easily marked.
     printf ',\n'
  done ) > op_types.inc
  *
  * Index with Iop_INVALID+opcode.
  */
+#define BIT(flag) (1 << flag)
 enum Op_Types {
-  OP_FP = 1, OP_INT = 2, OP_VEC = 4, OP_DEC = 8, OP_OLDFP = 16, OP_BITS = 32
+  OP_ALL=0, OP_MEM, OP_FP, OP_INT, OP_VEC, OP_DEC, OP_OLDFP, OP_BITS, 
+  N_OPS
 };
 static const UInt op_types[] = {
 #include "op_types.inc"
 0 /* dummy for syntax */ };
 
+typedef union {
+  struct { ULong longs[4];} packed;
+  struct { UChar bytes[N_OPS];} unpacked;
+} Buffer_t;
+
+static ULong global_ctrs[N_OPS];
+static ULong global_jumps;
+static ULong sb_ctr;
+
+static void record_counts(ULong ctrs1, 
+                          ULong ctrs2, 
+                          ULong ctrs3,
+                          ULong ctrs4)
+{
+  Buffer_t buffer = { .packed = {{ctrs1, ctrs2, ctrs3, ctrs4}} };
+  for (int i = 0; i < N_OPS; i++) {
+    global_ctrs[i] += buffer.unpacked.bytes[i];
+  }
+
+  global_jumps++;
+}
+
 static void og_post_clo_init(void)
 {
 }
 
-static ULong global_guest_insts,
-             global_mem_insts,
-             global_bit_insts,
-             global_int_insts,
-             global_float_insts,
-             global_vec_insts,
-             global_misc_insts,
-             global_jumps;
-
-static ULong sb_ctr;
-
-static void record_counts(ULong guest, 
-                          ULong mem, 
-                          ULong bit,
-                          ULong ints, 
-                          ULong floats, 
-                          ULong vec
-                          /*ULong misc*/)
-{
-   global_guest_insts += guest;
-   global_mem_insts += mem;
-   global_bit_insts += bit;
-   global_int_insts += ints;
-   global_float_insts += floats;
-   global_vec_insts += vec;
-   //global_misc_insts += misc;
-
-   global_jumps++;
+static void
+increment_counters(Buffer_t* insts, Buffer_t* is_flags) {
+  for (int i = 0; i < N_OPS; i++) {
+    if (is_flags->unpacked.bytes[i])
+      insts->unpacked.bytes[i]++;
+    tl_assert(insts->unpacked.bytes[i] < 0xFF);
+    is_flags->unpacked.bytes[i] = 0;
+  }
 }
 
+static void
+addCounterStmt(IRSB* sbOut, Buffer_t* insts) {
+  tl_assert(N_OPS <= sizeof(Buffer_t));
+  IRDirty*   di;
+  di = unsafeIRDirty_0_N( 0, "record_counts", 
+          VG_(fnptr_to_fnentry)( &record_counts ), 
+          mkIRExprVec_4(
+           IRExpr_Const(IRConst_U64(insts->packed.longs[0])),
+           IRExpr_Const(IRConst_U64(insts->packed.longs[1])),
+           IRExpr_Const(IRConst_U64(insts->packed.longs[2])),
+           IRExpr_Const(IRConst_U64(insts->packed.longs[3]))
+          ));
+  addStmtToIRSB( sbOut, IRStmt_Dirty(di) );
+  *insts = (Buffer_t) { .packed = {{0}} };
+}
 
 static
 IRSB* og_instrument ( VgCallbackClosure* closure,
@@ -105,18 +124,10 @@ IRSB* og_instrument ( VgCallbackClosure* closure,
                       IRType gWordTy, IRType hWordTy )
 {
    IRSB*      sbOut;
-   IRDirty*   di;
    Int        i;
 
-   UInt        guest_insts = 0;
-   UInt        mem_insts   = 0;
-   UInt        bit_insts   = 0;
-   UInt        int_insts   = 0;
-   UInt        float_insts = 0;
-   UInt        vec_insts   = 0;
-   UInt        misc_insts  = 0;
-   Bool is_mem = False, is_bit = False, is_int = False, 
-        is_float = False, is_vec = False, is_misc = False;
+   Buffer_t insts = { .unpacked = {{0}} };
+   Buffer_t is_flags = { .unpacked = {{0}} };
 
    if (gWordTy != hWordTy) {
       /* We don't currently support this case. */
@@ -149,13 +160,7 @@ IRSB* og_instrument ( VgCallbackClosure* closure,
 
          case Ist_IMark: {
             // we could look at the original instruction here, but that would need x86 decoding...
-            guest_insts++;
-            if (is_mem  ) {mem_insts++;   is_mem = False;}
-            if (is_bit  ) {bit_insts++;   is_bit = False;}
-            if (is_int  ) {int_insts++;   is_int = False;}
-            if (is_float) {float_insts++; is_float = False;}
-            if (is_vec  ) {vec_insts++;   is_vec = False;}
-            if (is_misc ) {misc_insts++;  is_misc = False;}
+            increment_counters(&insts, &is_flags);
             addStmtToIRSB( sbOut, st );
             break;
          }
@@ -163,7 +168,7 @@ IRSB* og_instrument ( VgCallbackClosure* closure,
          case Ist_WrTmp: {
             IRExpr* data = st->Ist.WrTmp.data;
             if (data->tag == Iex_Load) {
-              is_mem = True;
+              is_flags.unpacked.bytes[OP_MEM] = 1;
             }
             IRExpr* expr = st->Ist.WrTmp.data;
             UInt op = 0;
@@ -174,17 +179,13 @@ IRSB* og_instrument ( VgCallbackClosure* closure,
             if (op != 0)  {
               tl_assert(op > Iop_INVALID && op < Iop_LAST);
               UInt op_flags = op_types[op - Iop_INVALID];
-              if (op_flags & OP_FP)  is_float = True;
-              if (op_flags & OP_INT) is_int = True;
-              if (op_flags & OP_VEC) is_vec = True;
-              if (op_flags & OP_BITS) is_bit = True;
-              if (op_flags & OP_OLDFP || op_flags & OP_DEC) 
-                is_misc = True;
+              for (int f = 0; f < N_OPS; f++) {
+                if (op_flags & (1 << f)) {
+                  is_flags.unpacked.bytes[f] = 1;
+                }
+              }
             }
 
-            // TODO: look at opcodes to see what is done.
-            // on amd64, we will mostly see vector ops for
-            // FP (no x87), so we have to look at all of these.
             addStmtToIRSB( sbOut, st );
             break;
          }
@@ -194,33 +195,15 @@ IRSB* og_instrument ( VgCallbackClosure* closure,
          case Ist_LoadG: 
          case Ist_CAS:
          case Ist_LLSC: {
-            is_mem = True;
+            is_flags.unpacked.bytes[OP_MEM] = 1;
             addStmtToIRSB( sbOut, st );
             break;
          }
 
          case Ist_Exit: {
             // the last op is not followed by an imark, so have it here
-            if (is_mem  ) {mem_insts++;   is_mem = False;}
-            if (is_bit  ) {bit_insts++;   is_bit = False;}
-            if (is_int  ) {int_insts++;   is_int = False;}
-            if (is_float) {float_insts++; is_float = False;}
-            if (is_vec  ) {vec_insts++;   is_vec = False;}
-            if (is_misc ) {misc_insts++;  is_misc = False;}
-            di = unsafeIRDirty_0_N( 0, "record_counts", 
-                    VG_(fnptr_to_fnentry)( &record_counts ), 
-                    mkIRExprVec_6(
-                     IRExpr_Const(IRConst_U64(guest_insts)),
-                     IRExpr_Const(IRConst_U64(mem_insts  )),
-                     IRExpr_Const(IRConst_U64(bit_insts  )),
-                     IRExpr_Const(IRConst_U64(int_insts  )),
-                     IRExpr_Const(IRConst_U64(float_insts)),
-                     IRExpr_Const(IRConst_U64(vec_insts  ))
-                     /*IRExpr_Const(IRConst_U64(misc_insts ))*/));
-            addStmtToIRSB( sbOut, IRStmt_Dirty(di) );
-
-            guest_insts = mem_insts = bit_insts = int_insts 
-              = float_insts = vec_insts = misc_insts= 0;
+            increment_counters(&insts, &is_flags);
+            addCounterStmt(sbOut, &insts);
 
             addStmtToIRSB( sbOut, st );      // Original statement
             break;
@@ -231,45 +214,30 @@ IRSB* og_instrument ( VgCallbackClosure* closure,
             tl_assert(0);
       }
     }
-    // the last op is not followed by an imark, so have it here
-    if (is_mem  ) {mem_insts++;   is_mem = False;}
-    if (is_bit  ) {bit_insts++;   is_bit = False;}
-    if (is_int  ) {int_insts++;   is_int = False;}
-    if (is_float) {float_insts++; is_float = False;}
-    if (is_vec  ) {vec_insts++;   is_vec = False;}
-    if (is_misc ) {misc_insts++;  is_misc = False;}
-    // record final counts, in case of fallthrough
-    di = unsafeIRDirty_0_N( 0, "record_counts", 
-            VG_(fnptr_to_fnentry)( &record_counts ), 
-            mkIRExprVec_6(
-             IRExpr_Const(IRConst_U64(guest_insts)),
-             IRExpr_Const(IRConst_U64(mem_insts  )),
-             IRExpr_Const(IRConst_U64(bit_insts  )),
-             IRExpr_Const(IRConst_U64(int_insts  )),
-             IRExpr_Const(IRConst_U64(float_insts)),
-             IRExpr_Const(IRConst_U64(vec_insts  ))
-             /*IRExpr_Const(IRConst_U64(misc_insts ))*/));
-    addStmtToIRSB( sbOut, IRStmt_Dirty(di) );
-    
-    if (sb_ctr++ % 100 == 0) {
-      VG_(umsg)("At SB %d\n", sb_ctr);
-      ppIRSB(sbOut);
-    }
 
+    increment_counters(&insts, &is_flags);
+    // record final counts, in case of fallthrough
+    addCounterStmt(sbOut, &insts);
+    
+    //if (sb_ctr++ % 100 == 0) {
+      //VG_(umsg)("At SB %d\n", sb_ctr);
+      //ppIRSB(sbOut);
+    //}
          
     return sbOut;
 }
 
 static void og_fini(Int exitcode)
 {
-  VG_(umsg)("Executed %'llu instructions.\n", global_guest_insts);
+  VG_(umsg)("Executed %'llu instructions.\n", global_ctrs[OP_ALL]);
   VG_(umsg)("   %'llu jumps\n", global_jumps);
-  VG_(umsg)("   %'llu memory access related instructions\n", global_mem_insts);
-  VG_(umsg)("   %'llu bitwise operations\n", global_bit_insts);
-  VG_(umsg)("   %'llu integer operations\n", global_int_insts);
-  VG_(umsg)("   %'llu floating-point operations\n", global_float_insts);
-  VG_(umsg)("   %'llu vector/SIMD operations\n", global_vec_insts);
-  //VG_(umsg)("   %'llu strange operations\n", global_misc_insts);
+  VG_(umsg)("   %'llu memory access related instructions\n", global_ctrs[OP_MEM]);
+  VG_(umsg)("   %'llu bitwise operations\n", global_ctrs[OP_BITS]);
+  VG_(umsg)("   %'llu integer operations\n", global_ctrs[OP_INT]);
+  VG_(umsg)("   %'llu floating-point operations\n", global_ctrs[OP_FP]);
+  VG_(umsg)("   %'llu vector/SIMD operations\n", global_ctrs[OP_VEC]);
+  VG_(umsg)("   %'llu strange decimal operations\n", global_ctrs[OP_DEC]);
+  VG_(umsg)("   %'llu strange fp operations\n", global_ctrs[OP_OLDFP]);
   VG_(umsg)("Exit code:       %d\n", exitcode);
 }
 
