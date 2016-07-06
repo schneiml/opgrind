@@ -48,6 +48,17 @@
     [[ $op =~ F(32|64|128) ]]           && printf ' | BIT(OP_OLDFP)' # Scalar FP (x87), should not appear
     [[ $op =~ (U|I|S)(8|16|32|64) ]]    && printf ' | BIT(OP_INT)'   # Scalar int
     [[ $op =~ [UISFD][0-9]+|[0-9]+[UISFD] ]] || printf ' | BIT(OP_BITS)' # none of the above
+    [[ $op =~ Mul ]]                    && printf ' | BIT(OP_MUL)'   # 
+    [[ $op =~ Div ]]                    && printf ' | BIT(OP_DIV)'   # 
+    [[ $op =~ Add ]]                    && printf ' | BIT(OP_ADD)'   # 
+    [[ $op =~ Sub ]]                    && printf ' | BIT(OP_SUB)'   # 
+    [[ $op =~ Cmp ]]                    && printf ' | BIT(OP_CMP)'   # 
+    [[ $op =~ 32F0x4 ]]                 && printf ' | BIT(OP_SSE_SS)'   # addss and friends
+    [[ $op =~ 64F0x2 ]]                 && printf ' | BIT(OP_SSE_SD)'   # addsd and friends
+    [[ $op =~ 32Fx4  ]]                 && printf ' | BIT(OP_SSE_PS)'   # addps and friends
+    [[ $op =~ 64Fx2  ]]                 && printf ' | BIT(OP_SSE_PD)'   # addpd and friends
+    [[ $op =~ 32Fx8  ]]                 && printf ' | BIT(OP_AVX_PS)'   # vaddps and friends
+    [[ $op =~ 64Fx4  ]]                 && printf ' | BIT(OP_AVX_PD)'   # vaddpd and friends
     # Mul, Div, Add, Sub, conv ('to'), Sqrt, Cmp could also be easily marked.
     printf ',\n'
  done ) > op_types.inc
@@ -57,6 +68,8 @@
 #define BIT(flag) (1 << flag)
 enum Op_Types {
   OP_ALL=0, OP_MEM, OP_FP, OP_INT, OP_VEC, OP_DEC, OP_OLDFP, OP_BITS, 
+  OP_MUL, OP_DIV, OP_ADD, OP_SUB, OP_CMP,
+  OP_SSE_SS, OP_SSE_SD, OP_SSE_PS, OP_SSE_PD, OP_AVX_PS, OP_AVX_PD,
   N_OPS
 };
 static const UInt op_types[] = {
@@ -77,10 +90,27 @@ static void record_counts(ULong ctrs1,
                           ULong ctrs3,
                           ULong ctrs4)
 {
+#ifdef SLOW_CTRS
   Buffer_t buffer = { .packed = {{ctrs1, ctrs2, ctrs3, ctrs4}} };
   for (int i = 0; i < N_OPS; i++) {
     global_ctrs[i] += buffer.unpacked.bytes[i];
   }
+#else
+  // Endianness-dependent, fully unrolled code
+#define UNPACK_ONE(x, field, to) if (to < N_OPS) global_ctrs[to] += 0xFF & (x >> (8*field))
+#define UNPACK(x, to) UNPACK_ONE(x, 0, to + 0); \
+                      UNPACK_ONE(x, 1, to + 1); \
+                      UNPACK_ONE(x, 2, to + 2); \
+                      UNPACK_ONE(x, 3, to + 3); \
+                      UNPACK_ONE(x, 4, to + 4); \
+                      UNPACK_ONE(x, 5, to + 5); \
+                      UNPACK_ONE(x, 6, to + 6); \
+                      UNPACK_ONE(x, 7, to + 7); 
+  UNPACK(ctrs1, 0);
+  UNPACK(ctrs2, 8);
+  UNPACK(ctrs3, 16);
+  UNPACK(ctrs4, 24);
+#endif
 
   global_jumps++;
 }
@@ -230,14 +260,25 @@ IRSB* og_instrument ( VgCallbackClosure* closure,
 static void og_fini(Int exitcode)
 {
   VG_(umsg)("Executed %'llu instructions.\n", global_ctrs[OP_ALL]);
-  VG_(umsg)("   %'llu jumps\n", global_jumps);
-  VG_(umsg)("   %'llu memory access related instructions\n", global_ctrs[OP_MEM]);
-  VG_(umsg)("   %'llu bitwise operations\n", global_ctrs[OP_BITS]);
-  VG_(umsg)("   %'llu integer operations\n", global_ctrs[OP_INT]);
-  VG_(umsg)("   %'llu floating-point operations\n", global_ctrs[OP_FP]);
-  VG_(umsg)("   %'llu vector/SIMD operations\n", global_ctrs[OP_VEC]);
-  VG_(umsg)("   %'llu strange decimal operations\n", global_ctrs[OP_DEC]);
-  VG_(umsg)("   %'llu strange fp operations\n", global_ctrs[OP_OLDFP]);
+  VG_(umsg)("   %'15llu jumps\n", global_jumps);
+  VG_(umsg)("   %'15llu memory access related instructions\n", global_ctrs[OP_MEM]);
+  VG_(umsg)("   %'15llu bitwise operations\n", global_ctrs[OP_BITS]);
+  VG_(umsg)("   %'15llu integer operations\n", global_ctrs[OP_INT]);
+  VG_(umsg)("   %'15llu floating-point operations\n", global_ctrs[OP_FP]);
+  VG_(umsg)("   %'15llu vector/SIMD operations\n", global_ctrs[OP_VEC]);
+  VG_(umsg)("   %'15llu strange decimal operations\n", global_ctrs[OP_DEC]);
+  VG_(umsg)("   %'15llu strange fp operations\n", global_ctrs[OP_OLDFP]);
+  VG_(umsg)("   %'15llu muls\n", global_ctrs[OP_MUL]);
+  VG_(umsg)("   %'15llu divs\n", global_ctrs[OP_DIV]);
+  VG_(umsg)("   %'15llu adds\n", global_ctrs[OP_ADD]);
+  VG_(umsg)("   %'15llu subs\n", global_ctrs[OP_SUB]);
+  VG_(umsg)("   %'15llu cmps\n", global_ctrs[OP_CMP]);
+  VG_(umsg)("   %'15llu SSE SS\n", global_ctrs[OP_SSE_SS]);
+  VG_(umsg)("   %'15llu SSE SD\n", global_ctrs[OP_SSE_SD]);
+  VG_(umsg)("   %'15llu SSE PS\n", global_ctrs[OP_SSE_PS]);
+  VG_(umsg)("   %'15llu SSE PD\n", global_ctrs[OP_SSE_PD]);
+  VG_(umsg)("   %'15llu AVX PS\n", global_ctrs[OP_AVX_PS]);
+  VG_(umsg)("   %'15llu AVX PD\n", global_ctrs[OP_AVX_PD]);
   VG_(umsg)("Exit code:       %d\n", exitcode);
 }
 
