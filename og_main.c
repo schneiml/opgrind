@@ -70,11 +70,17 @@ enum Op_Types {
   OP_ALL=0, OP_MEM, OP_FP, OP_INT, OP_VEC, OP_DEC, OP_OLDFP, OP_BITS, 
   OP_MUL, OP_DIV, OP_ADD, OP_SUB, OP_CMP,
   OP_SSE_SS, OP_SSE_SD, OP_SSE_PS, OP_SSE_PD, OP_AVX_PS, OP_AVX_PD,
+  OP_CALL,
   N_OPS
 };
 static const UInt op_types[] = {
 #include "op_types.inc"
 0 /* dummy for syntax */ };
+
+static const UInt code_types[] = {
+  [0xe8] = BIT(OP_CALL),
+  [0xFF] = BIT(OP_CALL)
+};
 
 typedef union {
   struct { ULong longs[4];} packed;
@@ -189,9 +195,17 @@ IRSB* og_instrument ( VgCallbackClosure* closure,
             break;
 
          case Ist_IMark: {
-            // we could look at the original instruction here, but that would need x86 decoding...
             increment_counters(&insts, &is_flags);
             addStmtToIRSB( sbOut, st );
+
+            // we look at the original instruction here, that should use x86 decoding...
+            Addr a = st->Ist.IMark.addr;
+            UInt op_flags = code_types[*((UChar*)(a))]; // first op byte
+            for (int f = 0; f < N_OPS; f++) {
+              if (op_flags & (1 << f)) {
+                is_flags.unpacked.bytes[f] = 1;
+              }
+            }
             break;
          }
 
@@ -279,6 +293,7 @@ static void og_fini(Int exitcode)
   VG_(umsg)("   %'15llu SSE PD\n", global_ctrs[OP_SSE_PD]);
   VG_(umsg)("   %'15llu AVX PS\n", global_ctrs[OP_AVX_PS]);
   VG_(umsg)("   %'15llu AVX PD\n", global_ctrs[OP_AVX_PD]);
+  VG_(umsg)("   %'15llu call ops\n", global_ctrs[OP_CALL]);
   VG_(umsg)("Exit code:       %d\n", exitcode);
 }
 
